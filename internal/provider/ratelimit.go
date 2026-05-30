@@ -8,6 +8,16 @@ import (
 	"time"
 )
 
+// FetchInProgressError is returned when a duplicate deSEC records fetch for the
+// same domain is attempted while an earlier fetch is still in flight.
+type FetchInProgressError struct {
+	Domain string
+}
+
+func (e *FetchInProgressError) Error() string {
+	return fmt.Sprintf("deSEC records fetch already in progress for domain %s", e.Domain)
+}
+
 // RateLimitError is returned when a deSEC API call is short-circuited because
 // the client is still inside a throttle window observed from a prior 429
 // response. Returning this instead of hitting the API prevents the daily quota
@@ -28,8 +38,33 @@ type rateLimitTracker struct {
 	now           func() time.Time
 }
 
+type fetchTracker struct {
+	mu       sync.Mutex
+	inFlight map[string]struct{}
+}
+
 func newRateLimitTracker() *rateLimitTracker {
 	return &rateLimitTracker{now: time.Now}
+}
+
+func newFetchTracker() *fetchTracker {
+	return &fetchTracker{inFlight: make(map[string]struct{})}
+}
+
+func (t *fetchTracker) start(domain string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if _, ok := t.inFlight[domain]; ok {
+		return false
+	}
+	t.inFlight[domain] = struct{}{}
+	return true
+}
+
+func (t *fetchTracker) done(domain string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.inFlight, domain)
 }
 
 // record extends the throttle window. A shorter delay than the current

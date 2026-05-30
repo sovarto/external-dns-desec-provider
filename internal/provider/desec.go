@@ -21,6 +21,7 @@ type DesecClient struct {
 	defaultTTL    int
 	domainFilters []string
 	rateLimit     *rateLimitTracker
+	fetches       *fetchTracker
 }
 
 const (
@@ -53,6 +54,7 @@ func CreateDesecClient(config config.Config) (*DesecClient, error) {
 		defaultTTL:    config.DefaultTTL,
 		domainFilters: config.DomainFilters,
 		rateLimit:     tracker,
+		fetches:       newFetchTracker(),
 	}
 	return client, nil
 }
@@ -70,6 +72,11 @@ func (d *DesecClient) GetRecordsWithContext(ctx context.Context, domain string) 
 		log.Warnf("deSEC rate limit active; skipping GetRecords for %s", remaining)
 		return nil, &RateLimitError{RetryAfter: remaining}
 	}
+	if !d.fetches.start(domain) {
+		log.Warnf("deSEC records fetch already in progress for domain %s; skipping duplicate request", domain)
+		return nil, &FetchInProgressError{Domain: domain}
+	}
+	defer d.fetches.done(domain)
 
 	return d.client.Records.GetAll(ctx, domain, nil)
 }

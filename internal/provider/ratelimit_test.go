@@ -203,3 +203,32 @@ func TestGetEndpoints_ShortCircuitsDuringThrottle(t *testing.T) {
 		t.Errorf("RetryAfter = %s, want at least 9m", rle.RetryAfter)
 	}
 }
+
+func TestGetRecords_SkipsWhenFetchAlreadyInProgress(t *testing.T) {
+	cfg := config.Config{
+		APIToken:      "test-token",
+		DomainFilters: []string{"example.com"},
+		DefaultTTL:    3600,
+	}
+	client, err := CreateDesecClient(cfg)
+	if err != nil {
+		t.Fatalf("CreateDesecClient: %v", err)
+	}
+
+	if !client.fetches.start("example.com") {
+		t.Fatal("expected initial fetchTracker.start to succeed")
+	}
+	defer client.fetches.done("example.com")
+
+	_, err = client.GetRecords("example.com")
+	if err == nil {
+		t.Fatal("expected FetchInProgressError, got nil")
+	}
+	var fie *FetchInProgressError
+	if !errors.As(err, &fie) {
+		t.Fatalf("expected *FetchInProgressError, got %T: %v", err, err)
+	}
+	if fie.Domain != "example.com" {
+		t.Errorf("Domain = %q, want %q", fie.Domain, "example.com")
+	}
+}
