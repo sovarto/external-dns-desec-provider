@@ -177,3 +177,29 @@ func TestApplyChanges_ShortCircuitsDuringThrottle(t *testing.T) {
 		t.Errorf("RetryAfter = %s, want at least 9m", rle.RetryAfter)
 	}
 }
+
+func TestGetEndpoints_ShortCircuitsDuringThrottle(t *testing.T) {
+	cfg := config.Config{
+		APIToken:      "test-token",
+		DomainFilters: []string{"example.com"},
+		DefaultTTL:    3600,
+	}
+	client, err := CreateDesecClient(cfg)
+	if err != nil {
+		t.Fatalf("CreateDesecClient: %v", err)
+	}
+
+	client.rateLimit.record(10 * time.Minute)
+
+	_, err = client.GetEndpoints("example.com")
+	if err == nil {
+		t.Fatal("expected RateLimitError, got nil")
+	}
+	var rle *RateLimitError
+	if !errors.As(err, &rle) {
+		t.Fatalf("expected *RateLimitError, got %T: %v", err, err)
+	}
+	if rle.RetryAfter < 9*time.Minute {
+		t.Errorf("RetryAfter = %s, want at least 9m", rle.RetryAfter)
+	}
+}

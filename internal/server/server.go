@@ -10,7 +10,6 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/michelangelomo/external-dns-desec-provider/internal/config"
-	"github.com/michelangelomo/external-dns-desec-provider/internal/provider"
 	log "github.com/sirupsen/logrus"
 	"sigs.k8s.io/external-dns/endpoint"
 	"sigs.k8s.io/external-dns/plan"
@@ -20,8 +19,14 @@ type WebhookServer struct {
 	httpServer *http.Server
 }
 
+type desecAPI interface {
+	GetEndpointsWithContext(ctx context.Context, domain string) ([]*endpoint.Endpoint, error)
+	ApplyChanges(changes plan.Changes) error
+	AdjustEndpoints(endpoints []*endpoint.Endpoint) ([]*endpoint.Endpoint, error)
+}
+
 type webhook struct {
-	desecClient *provider.DesecClient
+	desecClient desecAPI
 	config      config.Config
 }
 
@@ -29,7 +34,7 @@ const (
 	externalDnsWebhookHeader = "application/external.dns.webhook+json;version=1"
 )
 
-func NewWebhookServer(desecClient *provider.DesecClient, config config.Config) *WebhookServer {
+func NewWebhookServer(desecClient desecAPI, config config.Config) *WebhookServer {
 	var webhook webhook
 	webhook.desecClient = desecClient
 	webhook.config = config
@@ -86,7 +91,7 @@ func (webhook webhook) recordsHandler(w http.ResponseWriter, r *http.Request) {
 	endpoints := []*endpoint.Endpoint{}
 
 	for _, domain := range webhook.config.DomainFilters {
-		domainEndpoints, err := webhook.desecClient.GetEndpoints(domain)
+		domainEndpoints, err := webhook.desecClient.GetEndpointsWithContext(r.Context(), domain)
 		if err != nil {
 			log.Errorf("failed to get records for domain %s: %v", domain, err)
 			w.WriteHeader(http.StatusInternalServerError)

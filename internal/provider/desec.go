@@ -62,13 +62,28 @@ func (d *DesecClient) GetDomains() ([]desec.Domain, error) {
 }
 
 func (d *DesecClient) GetRecords(domain string) ([]desec.RRSet, error) {
-	return d.client.Records.GetAll(d.ctx, domain, nil)
+	return d.GetRecordsWithContext(d.ctx, domain)
+}
+
+func (d *DesecClient) GetRecordsWithContext(ctx context.Context, domain string) ([]desec.RRSet, error) {
+	if remaining := d.rateLimit.wait(); remaining > 0 {
+		log.Warnf("deSEC rate limit active; skipping GetRecords for %s", remaining)
+		return nil, &RateLimitError{RetryAfter: remaining}
+	}
+
+	return d.client.Records.GetAll(ctx, domain, nil)
 }
 
 // GetEndpoints fetches all RRSets for a domain and converts them to external-dns Endpoints.
 func (d *DesecClient) GetEndpoints(domain string) ([]*endpoint.Endpoint, error) {
+	return d.GetEndpointsWithContext(d.ctx, domain)
+}
+
+// GetEndpointsWithContext fetches all RRSets for a domain using the provided context
+// and converts them to external-dns Endpoints.
+func (d *DesecClient) GetEndpointsWithContext(ctx context.Context, domain string) ([]*endpoint.Endpoint, error) {
 	log.Debugf("fetching records for domain %s", domain)
-	rrsets, err := d.client.Records.GetAll(d.ctx, domain, nil)
+	rrsets, err := d.GetRecordsWithContext(ctx, domain)
 	if err != nil {
 		return nil, err
 	}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -16,6 +17,33 @@ import (
 	"sigs.k8s.io/external-dns/endpoint"
 	"sigs.k8s.io/external-dns/plan"
 )
+
+type stubDesecClient struct {
+	getEndpointsWithContext func(context.Context, string) ([]*endpoint.Endpoint, error)
+	applyChanges            func(plan.Changes) error
+	adjustEndpoints         func([]*endpoint.Endpoint) ([]*endpoint.Endpoint, error)
+}
+
+func (s stubDesecClient) GetEndpointsWithContext(ctx context.Context, domain string) ([]*endpoint.Endpoint, error) {
+	if s.getEndpointsWithContext != nil {
+		return s.getEndpointsWithContext(ctx, domain)
+	}
+	return nil, nil
+}
+
+func (s stubDesecClient) ApplyChanges(changes plan.Changes) error {
+	if s.applyChanges != nil {
+		return s.applyChanges(changes)
+	}
+	return nil
+}
+
+func (s stubDesecClient) AdjustEndpoints(endpoints []*endpoint.Endpoint) ([]*endpoint.Endpoint, error) {
+	if s.adjustEndpoints != nil {
+		return s.adjustEndpoints(endpoints)
+	}
+	return endpoints, nil
+}
 
 func TestNewWebhookServer(t *testing.T) {
 	config := config.Config{
@@ -131,6 +159,36 @@ func TestRecordsHandler(t *testing.T) {
 			t.Errorf("Failed to decode response as JSON: %v", err)
 		}
 		// endpoints could be empty, which is fine for this test
+	}
+}
+
+func TestRecordsHandler_PassesRequestContext(t *testing.T) {
+	var sawCanceled bool
+	webhook := webhook{
+		desecClient: stubDesecClient{
+			getEndpointsWithContext: func(ctx context.Context, domain string) ([]*endpoint.Endpoint, error) {
+				if domain != "example.com" {
+					t.Fatalf("domain = %q, want example.com", domain)
+				}
+				sawCanceled = errors.Is(ctx.Err(), context.Canceled)
+				return []*endpoint.Endpoint{}, nil
+			},
+		},
+		config: config.Config{DomainFilters: []string{"example.com"}},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodGet, "/records", nil).WithContext(ctx)
+	w := httptest.NewRecorder()
+
+	webhook.recordsHandler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Status code = %v, want %v", w.Code, http.StatusOK)
+	}
+	if !sawCanceled {
+		t.Fatal("expected records handler to pass the canceled request context to the provider")
 	}
 }
 
