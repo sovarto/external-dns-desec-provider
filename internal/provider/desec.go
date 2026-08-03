@@ -73,8 +73,9 @@ func CreateDesecClient(config config.Config) (*DesecClient, error) {
 	httpClient := &http.Client{
 		Timeout: 10 * time.Second,
 		Transport: &rateLimitTransport{
-			inner:   http.DefaultTransport,
-			tracker: tracker,
+			inner:     http.DefaultTransport,
+			tracker:   tracker,
+			proactive: newProactiveLimiter(tracker.now),
 		},
 	}
 

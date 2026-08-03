@@ -215,6 +215,133 @@ func TestGetEndpoints_ShortCircuitsDuringThrottle(t *testing.T) {
 	}
 }
 
+func TestSlidingWindow_ReserveAndExpire(t *testing.T) {
+	now := time.Date(2026, 5, 19, 12, 0, 0, 0, time.UTC)
+	w := &slidingWindow{windowLimit: windowLimit{limit: 2, window: time.Second}}
+
+	if _, ok := w.reserve(now); !ok {
+		t.Fatal("first reserve must succeed")
+	}
+	if _, ok := w.reserve(now); !ok {
+		t.Fatal("second reserve must succeed")
+	}
+	wait, ok := w.reserve(now)
+	if ok {
+		t.Fatal("third reserve must be refused while window is full")
+	}
+	if wait <= 0 || wait > time.Second {
+		t.Errorf("wait = %s, want a positive sub-second value", wait)
+	}
+	// After the window elapses the oldest grant ages out.
+	if _, ok := w.reserve(now.Add(time.Second + time.Millisecond)); !ok {
+		t.Error("reserve must succeed once the window has elapsed")
+	}
+}
+
+// A read past the dns_api_cheap per-second limit must be told to sleep (a
+// sub-minute window), not short-circuited.
+func TestProactiveLimiter_ReadBlocksOnPerSecond(t *testing.T) {
+	now := time.Date(2026, 5, 19, 12, 0, 0, 0, time.UTC)
+	p := newProactiveLimiter(func() time.Time { return now })
+
+	for i := 0; i < 10; i++ { // exhaust the 10/s cheap window
+		if sleep, short := p.reserve(false, "example.com"); sleep != 0 || short != 0 {
+			t.Fatalf("read %d unexpectedly limited: sleep=%s short=%s", i, sleep, short)
+		}
+	}
+	sleep, short := p.reserve(false, "example.com")
+	if short != 0 {
+		t.Errorf("per-second read limit must sleep, not short-circuit (short=%s)", short)
+	}
+	if sleep <= 0 || sleep > time.Second {
+		t.Errorf("sleep = %s, want a positive sub-second value", sleep)
+	}
+}
+
+// A write past the per-domain expensive per-hour limit must short-circuit (an
+// hour window must never be slept on), surfaced to the caller as a wait.
+func TestProactiveLimiter_WriteShortCircuitsOnPerHour(t *testing.T) {
+	now := time.Date(2026, 5, 19, 12, 0, 0, 0, time.UTC)
+	p := newProactiveLimiter(func() time.Time { return now })
+
+	// Fill the per-hour window (100 grants) spaced 35s apart so they all stay
+	// within the hour but the 2/s and 15/min windows never trip first,
+	// isolating the hour window as the limiter that fires.
+	for i := 0; i < 100; i++ {
+		if sleep, short := p.reserve(true, "example.com"); sleep != 0 || short != 0 {
+			t.Fatalf("write %d unexpectedly limited: sleep=%s short=%s", i, sleep, short)
+		}
+		now = now.Add(35 * time.Second)
+	}
+	sleep, short := p.reserve(true, "example.com")
+	if sleep != 0 {
+		t.Errorf("per-hour write limit must short-circuit, not sleep (sleep=%s)", sleep)
+	}
+	if short <= 0 {
+		t.Errorf("expected a positive short-circuit wait, got %s", short)
+	}
+}
+
+// The per-domain expensive scope is keyed per domain: exhausting one domain's
+// window must not throttle another.
+func TestProactiveLimiter_ExpensiveIsPerDomain(t *testing.T) {
+	now := time.Date(2026, 5, 19, 12, 0, 0, 0, time.UTC)
+	p := newProactiveLimiter(func() time.Time { return now })
+
+	for i := 0; i < 2; i++ { // exhaust the 2/s window for a.example
+		if sleep, short := p.reserve(true, "a.example"); sleep != 0 || short != 0 {
+			t.Fatalf("write %d to a.example unexpectedly limited", i)
+		}
+	}
+	if sleep, short := p.reserve(true, "b.example"); sleep != 0 || short != 0 {
+		t.Errorf("b.example must not be throttled by a.example's window: sleep=%s short=%s", sleep, short)
+	}
+}
+
+// The reactive Retry-After window always wins over the proactive verdict.
+func TestApplyProactive_ReactiveWindowWins(t *testing.T) {
+	now := time.Date(2026, 5, 19, 12, 0, 0, 0, time.UTC)
+	tracker := &rateLimitTracker{now: func() time.Time { return now }}
+	tracker.record(10 * time.Minute)
+
+	rt := &rateLimitTransport{
+		inner:     http.DefaultTransport,
+		tracker:   tracker,
+		proactive: newProactiveLimiter(func() time.Time { return now }),
+	}
+
+	req, _ := http.NewRequest(http.MethodGet, "https://desec.io/api/v1/domains/example.com/rrsets/", nil)
+	err := rt.applyProactive(req)
+	var rle *RateLimitError
+	if !errors.As(err, &rle) {
+		t.Fatalf("expected *RateLimitError from the open reactive window, got %T: %v", err, err)
+	}
+	if rle.RetryAfter < 9*time.Minute {
+		t.Errorf("RetryAfter = %s, want the reactive 10m window", rle.RetryAfter)
+	}
+}
+
+func TestClassifyRRSetRequest(t *testing.T) {
+	tests := []struct {
+		method     string
+		path       string
+		wantWrite  bool
+		wantDomain string
+	}{
+		{http.MethodGet, "/api/v1/domains/example.com/rrsets/", false, "example.com"},
+		{http.MethodPut, "/api/v1/domains/example.com/rrsets/", true, "example.com"},
+		{http.MethodPost, "/api/v1/domains/sub.example.org/rrsets/", true, "sub.example.org"},
+		{http.MethodDelete, "/api/v1/domains/example.com/rrsets/www/A/", true, "example.com"},
+	}
+	for _, tt := range tests {
+		req, _ := http.NewRequest(tt.method, "https://desec.io"+tt.path, nil)
+		write, domain := classifyRRSetRequest(req)
+		if write != tt.wantWrite || domain != tt.wantDomain {
+			t.Errorf("classify(%s %s) = (%v, %q), want (%v, %q)", tt.method, tt.path, write, domain, tt.wantWrite, tt.wantDomain)
+		}
+	}
+}
+
 func TestCachedEndpoints_AllOrNothing(t *testing.T) {
 	now := time.Date(2026, 5, 19, 12, 0, 0, 0, time.UTC)
 	client, err := CreateDesecClient(config.Config{

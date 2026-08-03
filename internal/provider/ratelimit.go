@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -110,16 +111,186 @@ func (t *rateLimitTracker) wait() time.Duration {
 	return remaining
 }
 
-// rateLimitTransport is an http.RoundTripper that records Retry-After from any
-// 429 Too Many Requests responses observed on the wire, including ones
-// retryablehttp will subsequently retry.
+// deSEC rate-limit scopes exercised by this provider, from
+// https://desec.readthedocs.io/en/latest/rate-limits.html. Requests are checked
+// against these BEFORE going on the wire, so we avoid the 429 rather than react
+// to it. Sub-minute windows are cheap to wait out; the hour/day windows are
+// short-circuited to the cache/500 path instead of sleeping for hours.
+//
+//	dns_api_cheap                 10/s,  50/min                 reads, per user
+//	dns_api_per_domain_expensive  2/s, 15/min, 100/h, 300/day   writes, per user PER DOMAIN
+//	user                          2000/day                      any request, account-wide
+var (
+	cheapWindows      = []windowLimit{{10, time.Second}, {50, time.Minute}}
+	expensiveWindows  = []windowLimit{{2, time.Second}, {15, time.Minute}, {100, time.Hour}, {300, 24 * time.Hour}}
+	userDailyWindow   = []windowLimit{{userDailyRequestLimit, 24 * time.Hour}}
+	proactiveSleepCap = 5 * time.Second
+)
+
+// windowLimit is a max request count within a sliding time window.
+type windowLimit struct {
+	limit  int
+	window time.Duration
+}
+
+// slidingWindow tracks recent grant timestamps within its window and hands out
+// slots up to limit. It is the building block of every deSEC scope bucket.
+type slidingWindow struct {
+	windowLimit
+	grants []time.Time
+}
+
+// reserve, given the current time, either records a grant and returns (0, true)
+// or, if the window is full, returns the wait until the oldest grant expires and
+// (_, false). Expired grants are pruned on every call.
+func (w *slidingWindow) reserve(now time.Time) (time.Duration, bool) {
+	cutoff := now.Add(-w.window)
+	kept := w.grants[:0]
+	for _, g := range w.grants {
+		if g.After(cutoff) {
+			kept = append(kept, g)
+		}
+	}
+	w.grants = kept
+
+	if len(w.grants) < w.limit {
+		w.grants = append(w.grants, now)
+		return 0, true
+	}
+	// Full: the oldest grant must age out of the window before a slot frees.
+	return w.grants[0].Sub(cutoff), false
+}
+
+// scopeLimiter guards one deSEC scope key (a fixed scope, or a scope+domain for
+// the per-domain expensive bucket) with a sliding window per configured limit.
+type scopeLimiter struct {
+	mu      sync.Mutex
+	windows []*slidingWindow
+}
+
+func newScopeLimiter(limits []windowLimit) *scopeLimiter {
+	windows := make([]*slidingWindow, len(limits))
+	for i, l := range limits {
+		windows[i] = &slidingWindow{windowLimit: l}
+	}
+	return &scopeLimiter{windows: windows}
+}
+
+// proactiveLimiter holds the per-scope buckets consulted before a request. The
+// per-domain expensive scope is keyed lazily as domains are seen.
+type proactiveLimiter struct {
+	mu        sync.Mutex
+	cheap     *scopeLimiter
+	user      *scopeLimiter
+	expensive map[string]*scopeLimiter
+	now       func() time.Time
+}
+
+func newProactiveLimiter(now func() time.Time) *proactiveLimiter {
+	return &proactiveLimiter{
+		cheap:     newScopeLimiter(cheapWindows),
+		user:      newScopeLimiter(userDailyWindow),
+		expensive: make(map[string]*scopeLimiter),
+		now:       now,
+	}
+}
+
+func (p *proactiveLimiter) expensiveFor(domain string) *scopeLimiter {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	sl := p.expensive[domain]
+	if sl == nil {
+		sl = newScopeLimiter(expensiveWindows)
+		p.expensive[domain] = sl
+	}
+	return sl
+}
+
+// reserve checks the buckets for a read or write request against domain. It
+// returns the duration to sleep before proceeding (bounded by the caller) for
+// sub-minute windows, and shortCircuit=true with a *RateLimitError-worthy wait
+// when an hour/day window is full -- those must not be slept on. A slot is
+// reserved in every consulted window only when the whole request is admissible.
+func (p *proactiveLimiter) reserve(write bool, domain string) (sleep time.Duration, shortCircuit time.Duration) {
+	scopes := []*scopeLimiter{p.user}
+	if write {
+		scopes = append(scopes, p.expensiveFor(domain))
+	} else {
+		scopes = append(scopes, p.cheap)
+	}
+
+	now := p.now()
+
+	// First pass: probe without committing. If any hour/day window is full,
+	// short-circuit; otherwise take the longest sub-minute wait to sleep out.
+	// Probing avoids reserving slots we'd then abandon on a short-circuit.
+	var maxSleep, maxShort time.Duration
+	for _, sc := range scopes {
+		sc.mu.Lock()
+		for _, w := range sc.windows {
+			cutoff := now.Add(-w.window)
+			active := 0
+			var oldest time.Time
+			for _, g := range w.grants {
+				if g.After(cutoff) {
+					if active == 0 || g.Before(oldest) {
+						oldest = g
+					}
+					active++
+				}
+			}
+			if active < w.limit {
+				continue
+			}
+			wait := oldest.Sub(cutoff)
+			if w.window <= time.Minute {
+				if wait > maxSleep {
+					maxSleep = wait
+				}
+			} else if wait > maxShort {
+				maxShort = wait
+			}
+		}
+		sc.mu.Unlock()
+	}
+	if maxShort > 0 {
+		return 0, maxShort
+	}
+	if maxSleep > 0 {
+		return maxSleep, 0
+	}
+
+	// Admissible now: commit a grant in every window of every consulted scope.
+	for _, sc := range scopes {
+		sc.mu.Lock()
+		for _, w := range sc.windows {
+			_, _ = w.reserve(now)
+		}
+		sc.mu.Unlock()
+	}
+	return 0, 0
+}
+
+// rateLimitTransport is an http.RoundTripper that proactively throttles against
+// deSEC's documented scopes before a request, and reactively records Retry-After
+// from any 429 Too Many Requests responses observed on the wire (including ones
+// retryablehttp will subsequently retry). The reactive window always wins: a
+// recorded Retry-After short-circuits regardless of the proactive buckets.
 type rateLimitTransport struct {
-	inner   http.RoundTripper
-	tracker *rateLimitTracker
+	inner     http.RoundTripper
+	tracker   *rateLimitTracker
+	proactive *proactiveLimiter
 }
 
 func (rt *rateLimitTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	rt.tracker.observeRequest()
+
+	if rt.proactive != nil {
+		if err := rt.applyProactive(req); err != nil {
+			return nil, err
+		}
+	}
+
 	resp, err := rt.inner.RoundTrip(req)
 	if err != nil || resp == nil {
 		return resp, err
@@ -139,6 +310,59 @@ func (rt *rateLimitTransport) RoundTrip(req *http.Request) (*http.Response, erro
 		}
 	}
 	return resp, nil
+}
+
+// applyProactive enforces the proactive scope buckets and the reactive
+// Retry-After window before a request goes on the wire. The reactive window
+// always wins (max of the two next-allowed times): an hour/day scope or an open
+// 429 window short-circuits with a *RateLimitError so the caller falls to the
+// cache/500 path; a sub-minute scope is slept out, bounded by proactiveSleepCap
+// and honouring the request context.
+func (rt *rateLimitTransport) applyProactive(req *http.Request) error {
+	write, domain := classifyRRSetRequest(req)
+
+	sleep, shortCircuit := rt.proactive.reserve(write, domain)
+
+	// The reactive window (recorded from a prior 429) always wins.
+	if reactive := rt.tracker.wait(); reactive > shortCircuit {
+		shortCircuit = reactive
+	}
+	if shortCircuit > 0 {
+		return &RateLimitError{RetryAfter: shortCircuit}
+	}
+
+	if sleep > 0 {
+		if sleep > proactiveSleepCap {
+			sleep = proactiveSleepCap
+		}
+		t := time.NewTimer(sleep)
+		defer t.Stop()
+		select {
+		case <-t.C:
+		case <-req.Context().Done():
+			return req.Context().Err()
+		}
+	}
+	return nil
+}
+
+// classifyRRSetRequest inspects a deSEC rrsets request and reports whether it is
+// a write (mutating method) and the domain it targets. deSEC's URL shape is
+// /domains/<domain>/rrsets[/<subname>/<type>], so the segment after "domains"
+// is the per-domain key for the expensive write scope.
+func classifyRRSetRequest(req *http.Request) (write bool, domain string) {
+	switch req.Method {
+	case http.MethodPut, http.MethodPost, http.MethodPatch, http.MethodDelete:
+		write = true
+	}
+	parts := strings.Split(strings.Trim(req.URL.Path, "/"), "/")
+	for i, p := range parts {
+		if p == "domains" && i+1 < len(parts) {
+			domain = parts[i+1]
+			break
+		}
+	}
+	return write, domain
 }
 
 // peekThrottleDetail reads deSEC's JSON throttle body ("Request was throttled.
