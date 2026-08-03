@@ -121,12 +121,12 @@ func (d *DesecClient) GetEndpoints(ctx context.Context, domain string) ([]*endpo
 		return nil, &RateLimitError{RetryAfter: remaining}
 	}
 
-	log.Debugf("fetching records for domain %s", domain)
+	log.Infof("fetching records for domain %s", domain)
 	rrsets, err := d.client.Records.GetAll(ctx, domain, nil)
 	if err != nil {
 		return nil, err
 	}
-	log.Debugf("fetched %d rrsets for domain %s", len(rrsets), domain)
+	log.Infof("fetched %d rrsets for domain %s", len(rrsets), domain)
 
 	endpoints := make([]*endpoint.Endpoint, 0, len(rrsets))
 	for _, rrset := range rrsets {

@@ -156,6 +156,7 @@ func (webhook webhook) applyChangesHandler(w http.ResponseWriter, r *http.Reques
 
 	err := json.NewDecoder(r.Body).Decode(&changes)
 	if err != nil {
+		log.Warnf("failed to decode /records POST body: %v", err)
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
@@ -191,6 +192,7 @@ func (webhook webhook) adjustEndpointsHandler(w http.ResponseWriter, r *http.Req
 
 	err := json.NewDecoder(r.Body).Decode(&adjustedEndpoints)
 	if err != nil {
+		log.Warnf("failed to decode /adjustendpoints POST body: %v", err)
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
