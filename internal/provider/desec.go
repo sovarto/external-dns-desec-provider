@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -16,7 +17,6 @@ import (
 
 type DesecClient struct {
 	client        *desec.Client
-	ctx           context.Context
 	dryRun        bool
 	defaultTTL    int
 	domainFilters []string
@@ -26,6 +26,27 @@ type DesecClient struct {
 const (
 	minimumTTL = 3600 // Minimum TTL for desec is 3600 seconds
 )
+
+// retryableLogger adapts logrus to retryablehttp.LeveledLogger so the retry
+// client's status codes and wait durations surface in the app's log stream.
+type retryableLogger struct{}
+
+func (retryableLogger) Error(msg string, kv ...any) { log.WithFields(kvFields(kv)).Error(msg) }
+func (retryableLogger) Warn(msg string, kv ...any)  { log.WithFields(kvFields(kv)).Warn(msg) }
+func (retryableLogger) Info(msg string, kv ...any)  { log.WithFields(kvFields(kv)).Info(msg) }
+func (retryableLogger) Debug(msg string, kv ...any) { log.WithFields(kvFields(kv)).Debug(msg) }
+
+func kvFields(kv []any) log.Fields {
+	fields := log.Fields{}
+	for i := 0; i+1 < len(kv); i += 2 {
+		key, ok := kv[i].(string)
+		if !ok {
+			key = fmt.Sprintf("%v", kv[i])
+		}
+		fields[key] = kv[i+1]
+	}
+	return fields
+}
 
 func CreateDesecClient(config config.Config) (*DesecClient, error) {
 	if config.DefaultTTL < minimumTTL {
@@ -42,13 +63,14 @@ func CreateDesecClient(config config.Config) (*DesecClient, error) {
 		},
 	}
 
-	ctx := context.Background()
 	client := &DesecClient{
 		client: desec.New(config.APIToken, desec.ClientOptions{
 			RetryMax:   2,
 			HTTPClient: httpClient,
+			// Without a logger retryablehttp swallows the 429 and its retry
+			// wait, which is how the ~12.5h sleep was invisible in the logs.
+			Logger: retryableLogger{},
 		}),
-		ctx:           ctx,
 		dryRun:        config.DryRun,
 		defaultTTL:    config.DefaultTTL,
 		domainFilters: config.DomainFilters,
@@ -57,18 +79,33 @@ func CreateDesecClient(config config.Config) (*DesecClient, error) {
 	return client, nil
 }
 
-func (d *DesecClient) GetDomains() ([]desec.Domain, error) {
-	return d.client.Domains.GetAll(d.ctx)
+func (d *DesecClient) GetDomains(ctx context.Context) ([]desec.Domain, error) {
+	return d.client.Domains.GetAll(ctx)
 }
 
-func (d *DesecClient) GetRecords(domain string) ([]desec.RRSet, error) {
-	return d.client.Records.GetAll(d.ctx, domain, nil)
+func (d *DesecClient) GetRecords(ctx context.Context, domain string) ([]desec.RRSet, error) {
+	if remaining := d.rateLimit.wait(); remaining > 0 {
+		return nil, &RateLimitError{RetryAfter: remaining}
+	}
+	return d.client.Records.GetAll(ctx, domain, nil)
 }
 
 // GetEndpoints fetches all RRSets for a domain and converts them to external-dns Endpoints.
-func (d *DesecClient) GetEndpoints(domain string) ([]*endpoint.Endpoint, error) {
+// The caller's context is threaded through to the deSEC call so external-dns's
+// webhook read timeout can interrupt a request stuck retrying a 429 -- the
+// deSEC library sleeps the raw Retry-After (up to ~12.5h) between retries and
+// only wakes on ctx cancellation or the timer.
+func (d *DesecClient) GetEndpoints(ctx context.Context, domain string) ([]*endpoint.Endpoint, error) {
+	// Skip the API entirely while a throttle window observed from a prior 429
+	// is still open: hitting deSEC again would only burn more of the daily
+	// quota and return another long Retry-After.
+	if remaining := d.rateLimit.wait(); remaining > 0 {
+		log.Warnf("deSEC rate limit active; skipping /records fetch for %s (retry after %s)", domain, remaining)
+		return nil, &RateLimitError{RetryAfter: remaining}
+	}
+
 	log.Debugf("fetching records for domain %s", domain)
-	rrsets, err := d.client.Records.GetAll(d.ctx, domain, nil)
+	rrsets, err := d.client.Records.GetAll(ctx, domain, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -84,7 +121,7 @@ func (d *DesecClient) GetEndpoints(domain string) ([]*endpoint.Endpoint, error) 
 	return endpoints, nil
 }
 
-func (d *DesecClient) ApplyChanges(changes plan.Changes) error {
+func (d *DesecClient) ApplyChanges(ctx context.Context, changes plan.Changes) error {
 	if remaining := d.rateLimit.wait(); remaining > 0 {
 		log.Warnf("deSEC rate limit active; skipping ApplyChanges for %s to preserve daily quota", remaining)
 		return &RateLimitError{RetryAfter: remaining}
@@ -156,7 +193,7 @@ func (d *DesecClient) ApplyChanges(changes plan.Changes) error {
 
 		log.Debugf("applying %d changes for domain %s (%d create, %d update, %d delete): %v",
 			len(toApply), domain, len(bc.create), len(bc.updateNew), len(bc.delete), toApply)
-		_, err := d.client.Records.BulkUpdate(d.ctx, desec.FullResource, domain, toApply)
+		_, err := d.client.Records.BulkUpdate(ctx, desec.FullResource, domain, toApply)
 		if err != nil {
 			log.Errorf("failed to apply changes for domain %s: %v, payload: %v", domain, err, toApply)
 			return err

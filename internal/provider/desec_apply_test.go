@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -209,7 +210,7 @@ func TestDesecMock_RejectsCNAMEOverExistingA(t *testing.T) {
 	srv := m.server(t)
 	client := newTestClient(t, srv)
 
-	_, err := client.client.Records.BulkCreate(client.ctx, "example.com", []desec.RRSet{
+	_, err := client.client.Records.BulkCreate(context.Background(), "example.com", []desec.RRSet{
 		{SubName: "foo", Type: "CNAME", Records: []string{"bar.example."}, TTL: 3600},
 	})
 	if err == nil {
@@ -246,7 +247,7 @@ func TestApplyChanges_RetypeAtoCNAME(t *testing.T) {
 		},
 	}
 
-	err := client.ApplyChanges(changes)
+	err := client.ApplyChanges(context.Background(), changes)
 	if err != nil {
 		t.Fatalf("ApplyChanges(retype A->CNAME) must succeed after the atomic-bulk fix, got: %v", err)
 	}
@@ -276,7 +277,7 @@ func TestApplyChanges_CombinesUpdateAndCreateInOneRequest(t *testing.T) {
 		},
 	}
 
-	err := client.ApplyChanges(changes)
+	err := client.ApplyChanges(context.Background(), changes)
 	if err != nil {
 		t.Fatalf("ApplyChanges(update+create) returned error: %v", err)
 	}
@@ -317,7 +318,7 @@ func TestApplyChanges_DryRunMakesNoRequests(t *testing.T) {
 		},
 	}
 
-	if err := client.ApplyChanges(changes); err != nil {
+	if err := client.ApplyChanges(context.Background(), changes); err != nil {
 		t.Fatalf("dry-run ApplyChanges returned error: %v", err)
 	}
 

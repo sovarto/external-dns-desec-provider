@@ -134,6 +134,80 @@ func TestRecordsHandler(t *testing.T) {
 	}
 }
 
+// throttledProvider is a desecProvider that always reports an open deSEC
+// throttle window, so the handler mapping (RateLimitError -> 500 + Retry-After)
+// can be tested without driving a real retry loop.
+type throttledProvider struct{ retryAfter time.Duration }
+
+func (p throttledProvider) GetEndpoints(_ context.Context, _ string) ([]*endpoint.Endpoint, error) {
+	return nil, &provider.RateLimitError{RetryAfter: p.retryAfter}
+}
+
+func (p throttledProvider) ApplyChanges(_ context.Context, _ plan.Changes) error {
+	return &provider.RateLimitError{RetryAfter: p.retryAfter}
+}
+
+func (p throttledProvider) AdjustEndpoints(eps []*endpoint.Endpoint) ([]*endpoint.Endpoint, error) {
+	return eps, nil
+}
+
+func throttledWebhook(retryAfter time.Duration) webhook {
+	cfg := config.Config{DomainFilters: []string{"example.com"}}
+	return webhook{desecClient: throttledProvider{retryAfter: retryAfter}, config: cfg}
+}
+
+// A deSEC throttle must surface to external-dns as 500 (a retryable SoftError),
+// NEVER 429, which external-dns treats as a hard fatal error. The real
+// Retry-After is still exposed for operators even though external-dns ignores
+// it.
+func TestRecordsHandler_ThrottleReturns500Not429(t *testing.T) {
+	webhook := throttledWebhook(600 * time.Second)
+
+	log.SetLevel(log.ErrorLevel)
+	defer log.SetLevel(log.InfoLevel)
+
+	req := httptest.NewRequest("GET", "/records", nil)
+	w := httptest.NewRecorder()
+	webhook.recordsHandler(w, req)
+
+	if w.Code == http.StatusTooManyRequests {
+		t.Fatalf("recordsHandler returned 429; external-dns treats that as fatal")
+	}
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("Status code = %v, want %v", w.Code, http.StatusInternalServerError)
+	}
+	if got := w.Header().Get("Retry-After"); got != "600" {
+		t.Errorf("Retry-After = %q, want \"600\"", got)
+	}
+}
+
+func TestApplyChangesHandler_ThrottleReturns500Not429(t *testing.T) {
+	webhook := throttledWebhook(600 * time.Second)
+
+	log.SetLevel(log.ErrorLevel)
+	defer log.SetLevel(log.InfoLevel)
+
+	body, _ := json.Marshal(plan.Changes{
+		Create: []*endpoint.Endpoint{
+			{DNSName: "x.example.com", RecordType: "A", Targets: endpoint.Targets{"192.0.2.1"}, RecordTTL: 3600},
+		},
+	})
+	req := httptest.NewRequest("POST", "/records", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	webhook.applyChangesHandler(w, req)
+
+	if w.Code == http.StatusTooManyRequests {
+		t.Fatalf("applyChangesHandler returned 429; external-dns treats that as fatal")
+	}
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("Status code = %v, want %v", w.Code, http.StatusInternalServerError)
+	}
+	if got := w.Header().Get("Retry-After"); got != "600" {
+		t.Errorf("Retry-After = %q, want \"600\"", got)
+	}
+}
+
 func TestApplyChangesHandler(t *testing.T) {
 	tests := []struct {
 		name           string

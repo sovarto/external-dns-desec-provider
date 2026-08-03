@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 
 	"github.com/gorilla/mux"
 	"github.com/michelangelomo/external-dns-desec-provider/internal/config"
@@ -20,8 +22,17 @@ type WebhookServer struct {
 	httpServer *http.Server
 }
 
+// desecProvider is the subset of *provider.DesecClient the handlers use. An
+// interface here lets tests inject a throttled fake without driving a real
+// retry loop.
+type desecProvider interface {
+	GetEndpoints(ctx context.Context, domain string) ([]*endpoint.Endpoint, error)
+	ApplyChanges(ctx context.Context, changes plan.Changes) error
+	AdjustEndpoints(endpoints []*endpoint.Endpoint) ([]*endpoint.Endpoint, error)
+}
+
 type webhook struct {
-	desecClient *provider.DesecClient
+	desecClient desecProvider
 	config      config.Config
 }
 
@@ -29,7 +40,7 @@ const (
 	externalDnsWebhookHeader = "application/external.dns.webhook+json;version=1"
 )
 
-func NewWebhookServer(desecClient *provider.DesecClient, config config.Config) *WebhookServer {
+func NewWebhookServer(desecClient desecProvider, config config.Config) *WebhookServer {
 	var webhook webhook
 	webhook.desecClient = desecClient
 	webhook.config = config
@@ -86,8 +97,21 @@ func (webhook webhook) recordsHandler(w http.ResponseWriter, r *http.Request) {
 	endpoints := []*endpoint.Endpoint{}
 
 	for _, domain := range webhook.config.DomainFilters {
-		domainEndpoints, err := webhook.desecClient.GetEndpoints(domain)
+		domainEndpoints, err := webhook.desecClient.GetEndpoints(r.Context(), domain)
 		if err != nil {
+			// external-dns's webhook client treats 429 as a HARD fatal error and
+			// only 500..510 as a retryable SoftError, so a throttle must surface
+			// as 500 (logged + retried next interval, no crash) -- never 429. The
+			// real Retry-After is still exposed for operators even though
+			// external-dns ignores it.
+			var rle *provider.RateLimitError
+			if errors.As(err, &rle) {
+				log.Warnf("rate limited fetching records for domain %s: %v", domain, rle)
+				w.Header().Set("Retry-After", strconv.Itoa(int(rle.RetryAfter.Seconds())))
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = fmt.Fprintf(w, "deSEC rate limit active, retry after %s", rle.RetryAfter)
+				return
+			}
 			log.Errorf("failed to get records for domain %s: %v", domain, err)
 			w.WriteHeader(http.StatusInternalServerError)
 			_, _ = fmt.Fprintf(w, "failed to get records for domain %s: %v", domain, err)
@@ -120,8 +144,19 @@ func (webhook webhook) applyChangesHandler(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	err = webhook.desecClient.ApplyChanges(changes)
+	err = webhook.desecClient.ApplyChanges(r.Context(), changes)
 	if err != nil {
+		// A throttle on the write path is 500 for the same reason as the read
+		// path: 429 would be fatal to external-dns, 500 becomes a retryable
+		// SoftError. Expose the real Retry-After even though it is ignored.
+		var rle *provider.RateLimitError
+		if errors.As(err, &rle) {
+			log.Warnf("rate limited applying changes: %v", rle)
+			w.Header().Set("Retry-After", strconv.Itoa(int(rle.RetryAfter.Seconds())))
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = fmt.Fprintf(w, "deSEC rate limit active, retry after %s", rle.RetryAfter)
+			return
+		}
 		log.Errorf("failed to apply changes: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return

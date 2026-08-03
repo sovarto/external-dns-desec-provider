@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"context"
 	"encoding/json"
 	"reflect"
 	"strings"
@@ -569,7 +570,7 @@ func TestApplyChangesDryRun(t *testing.T) {
 	}
 
 	// This should not return an error in dry run mode
-	err = client.ApplyChanges(changes)
+	err = client.ApplyChanges(context.Background(), changes)
 	if err != nil {
 		t.Errorf("ApplyChanges in dry run mode returned error: %v", err)
 	}

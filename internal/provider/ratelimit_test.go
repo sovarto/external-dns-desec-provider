@@ -1,9 +1,12 @@
 package provider
 
 import (
+	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -118,6 +121,44 @@ func TestRateLimitTransport_CapturesRetryAfter(t *testing.T) {
 	}
 }
 
+// TestRateLimitTransport_ClampsRetryAfterHeader pins the fix for the ~12.5h
+// silent sleep: a large Retry-After must be recorded verbatim in the tracker
+// (so the next call short-circuits for the real window) but clamped in the
+// response header the deSEC retry client sees, so a single retry can never
+// sleep for hours.
+func TestRateLimitTransport_ClampsRetryAfterHeader(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "45000") // deSEC daily-quota style value
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"detail":"Request was throttled. Expected available in 45000 seconds."}`))
+	}))
+	defer server.Close()
+
+	tracker := newRateLimitTracker()
+	client := &http.Client{
+		Transport: &rateLimitTransport{inner: http.DefaultTransport, tracker: tracker},
+	}
+
+	req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if got := resp.Header.Get("Retry-After"); got != "30" {
+		t.Errorf("clamped Retry-After header = %q, want \"30\"", got)
+	}
+	if d := tracker.wait(); d < 44900*time.Second {
+		t.Errorf("tracker.wait() = %s, want the full ~45000s window recorded", d)
+	}
+	// Body must survive the throttle-detail peek so the caller can still read it.
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "throttled") {
+		t.Errorf("response body was consumed by detail peek: %q", body)
+	}
+}
+
 func TestRateLimitTransport_IgnoresNon429(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Retry-After", "60") // present but irrelevant on 200
@@ -142,6 +183,38 @@ func TestRateLimitTransport_IgnoresNon429(t *testing.T) {
 	}
 }
 
+func TestGetEndpoints_ShortCircuitsDuringThrottle(t *testing.T) {
+	cfg := config.Config{
+		APIToken:      "test-token",
+		DomainFilters: []string{"example.com"},
+		DefaultTTL:    3600,
+	}
+	client, err := CreateDesecClient(cfg)
+	if err != nil {
+		t.Fatalf("CreateDesecClient: %v", err)
+	}
+
+	// Point at a server that fails the test if it is ever reached: an open
+	// throttle window must be answered from the tracker without a network call.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("deSEC must not be called while throttle window is open")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	client.client.BaseURL = srv.URL + "/"
+
+	client.rateLimit.record(10 * time.Minute)
+
+	_, err = client.GetEndpoints(context.Background(), "example.com")
+	var rle *RateLimitError
+	if !errors.As(err, &rle) {
+		t.Fatalf("expected *RateLimitError, got %T: %v", err, err)
+	}
+	if rle.RetryAfter < 9*time.Minute {
+		t.Errorf("RetryAfter = %s, want at least 9m", rle.RetryAfter)
+	}
+}
+
 func TestApplyChanges_ShortCircuitsDuringThrottle(t *testing.T) {
 	cfg := config.Config{
 		APIToken:      "test-token",
@@ -155,7 +228,7 @@ func TestApplyChanges_ShortCircuitsDuringThrottle(t *testing.T) {
 
 	client.rateLimit.record(10 * time.Minute)
 
-	err = client.ApplyChanges(plan.Changes{
+	err = client.ApplyChanges(context.Background(), plan.Changes{
 		Create: []*endpoint.Endpoint{
 			{
 				DNSName:    "x.example.com",
