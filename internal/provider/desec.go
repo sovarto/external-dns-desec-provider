@@ -100,11 +100,17 @@ func (d *DesecClient) GetDomains(ctx context.Context) ([]desec.Domain, error) {
 	return d.client.Domains.GetAll(ctx)
 }
 
-func (d *DesecClient) GetRecords(ctx context.Context, domain string) ([]desec.RRSet, error) {
-	if remaining := d.rateLimit.wait(); remaining > 0 {
-		return nil, &RateLimitError{RetryAfter: remaining}
+// checkThrottle returns a *RateLimitError while a throttle window observed from
+// a prior 429 is still open, so a call can skip the API entirely: hitting deSEC
+// again would only burn more of the daily quota and return another long
+// Retry-After. op names the skipped operation for the log line.
+func (d *DesecClient) checkThrottle(op string) *RateLimitError {
+	remaining := d.rateLimit.wait()
+	if remaining <= 0 {
+		return nil
 	}
-	return d.client.Records.GetAll(ctx, domain, nil)
+	log.Warnf("deSEC rate limit active; skipping %s (retry after %s)", op, remaining)
+	return &RateLimitError{RetryAfter: remaining}
 }
 
 // GetEndpoints fetches all RRSets for a domain and converts them to external-dns Endpoints.
@@ -113,12 +119,8 @@ func (d *DesecClient) GetRecords(ctx context.Context, domain string) ([]desec.RR
 // deSEC library sleeps the raw Retry-After (up to ~12.5h) between retries and
 // only wakes on ctx cancellation or the timer.
 func (d *DesecClient) GetEndpoints(ctx context.Context, domain string) ([]*endpoint.Endpoint, error) {
-	// Skip the API entirely while a throttle window observed from a prior 429
-	// is still open: hitting deSEC again would only burn more of the daily
-	// quota and return another long Retry-After.
-	if remaining := d.rateLimit.wait(); remaining > 0 {
-		log.Warnf("deSEC rate limit active; skipping /records fetch for %s (retry after %s)", domain, remaining)
-		return nil, &RateLimitError{RetryAfter: remaining}
+	if rle := d.checkThrottle("/records fetch for " + domain); rle != nil {
+		return nil, rle
 	}
 
 	log.Infof("fetching records for domain %s", domain)
@@ -178,9 +180,8 @@ func (d *DesecClient) CachedEndpoints(domains []string) ([]*endpoint.Endpoint, b
 }
 
 func (d *DesecClient) ApplyChanges(ctx context.Context, changes plan.Changes) error {
-	if remaining := d.rateLimit.wait(); remaining > 0 {
-		log.Warnf("deSEC rate limit active; skipping ApplyChanges for %s to preserve daily quota", remaining)
-		return &RateLimitError{RetryAfter: remaining}
+	if rle := d.checkThrottle("ApplyChanges"); rle != nil {
+		return rle
 	}
 
 	log.Debugf("applying changes: %d creates, %d updates, %d deletes",
