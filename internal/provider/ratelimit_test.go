@@ -215,6 +215,63 @@ func TestGetEndpoints_ShortCircuitsDuringThrottle(t *testing.T) {
 	}
 }
 
+func TestCachedEndpoints_AllOrNothing(t *testing.T) {
+	now := time.Date(2026, 5, 19, 12, 0, 0, 0, time.UTC)
+	client, err := CreateDesecClient(config.Config{
+		APIToken:      "test-token",
+		DomainFilters: []string{"a.example", "b.example"},
+		DefaultTTL:    3600,
+	})
+	if err != nil {
+		t.Fatalf("CreateDesecClient: %v", err)
+	}
+	client.rateLimit.now = func() time.Time { return now }
+
+	client.cache["a.example"] = cachedEndpoints{
+		endpoints: []*endpoint.Endpoint{{DNSName: "x.a.example", RecordType: "A"}},
+		fetchedAt: now,
+	}
+
+	// b.example was never fetched -> all-or-nothing must refuse.
+	if _, ok := client.CachedEndpoints([]string{"a.example", "b.example"}); ok {
+		t.Fatal("CachedEndpoints returned ok with a missing domain; must be all-or-nothing")
+	}
+
+	client.cache["b.example"] = cachedEndpoints{
+		endpoints: []*endpoint.Endpoint{{DNSName: "y.b.example", RecordType: "A"}},
+		fetchedAt: now,
+	}
+	eps, ok := client.CachedEndpoints([]string{"a.example", "b.example"})
+	if !ok {
+		t.Fatal("CachedEndpoints refused a full, fresh cache")
+	}
+	if len(eps) != 2 {
+		t.Errorf("cached endpoints = %d, want 2", len(eps))
+	}
+}
+
+func TestCachedEndpoints_RefusesStale(t *testing.T) {
+	now := time.Date(2026, 5, 19, 12, 0, 0, 0, time.UTC)
+	client, err := CreateDesecClient(config.Config{
+		APIToken:      "test-token",
+		DomainFilters: []string{"a.example"},
+		DefaultTTL:    3600,
+	})
+	if err != nil {
+		t.Fatalf("CreateDesecClient: %v", err)
+	}
+	client.rateLimit.now = func() time.Time { return now }
+
+	client.cache["a.example"] = cachedEndpoints{
+		endpoints: []*endpoint.Endpoint{{DNSName: "x.a.example", RecordType: "A"}},
+		fetchedAt: now.Add(-maxCacheStaleness - time.Minute),
+	}
+
+	if _, ok := client.CachedEndpoints([]string{"a.example"}); ok {
+		t.Error("CachedEndpoints served a cache older than maxCacheStaleness")
+	}
+}
+
 func TestApplyChanges_ShortCircuitsDuringThrottle(t *testing.T) {
 	cfg := config.Config{
 		APIToken:      "test-token",

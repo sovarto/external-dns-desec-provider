@@ -135,9 +135,14 @@ func TestRecordsHandler(t *testing.T) {
 }
 
 // throttledProvider is a desecProvider that always reports an open deSEC
-// throttle window, so the handler mapping (RateLimitError -> 500 + Retry-After)
-// can be tested without driving a real retry loop.
-type throttledProvider struct{ retryAfter time.Duration }
+// throttle window, so the handler mapping (RateLimitError -> cache or
+// 500 + Retry-After) can be tested without driving a real retry loop. When
+// cached is set, CachedEndpoints returns it all-or-nothing.
+type throttledProvider struct {
+	retryAfter time.Duration
+	cached     []*endpoint.Endpoint
+	hasCache   bool
+}
 
 func (p throttledProvider) GetEndpoints(_ context.Context, _ string) ([]*endpoint.Endpoint, error) {
 	return nil, &provider.RateLimitError{RetryAfter: p.retryAfter}
@@ -149,6 +154,12 @@ func (p throttledProvider) ApplyChanges(_ context.Context, _ plan.Changes) error
 
 func (p throttledProvider) AdjustEndpoints(eps []*endpoint.Endpoint) ([]*endpoint.Endpoint, error) {
 	return eps, nil
+}
+
+func (p throttledProvider) Throttled() bool { return true }
+
+func (p throttledProvider) CachedEndpoints(_ []string) ([]*endpoint.Endpoint, bool) {
+	return p.cached, p.hasCache
 }
 
 func throttledWebhook(retryAfter time.Duration) webhook {
@@ -178,6 +189,54 @@ func TestRecordsHandler_ThrottleReturns500Not429(t *testing.T) {
 	}
 	if got := w.Header().Get("Retry-After"); got != "600" {
 		t.Errorf("Retry-After = %q, want \"600\"", got)
+	}
+}
+
+// While throttled, a full last-known-good cache is served as 200 rather than
+// failing, so external-dns keeps a correct view of the zone.
+func TestRecordsHandler_ServesCacheWhenWindowOpen(t *testing.T) {
+	cached := []*endpoint.Endpoint{
+		{DNSName: "a.example.com", RecordType: "A", Targets: endpoint.Targets{"192.0.2.1"}, RecordTTL: 3600},
+	}
+	webhook := webhook{
+		desecClient: throttledProvider{retryAfter: 600 * time.Second, cached: cached, hasCache: true},
+		config:      config.Config{DomainFilters: []string{"example.com"}},
+	}
+
+	log.SetLevel(log.ErrorLevel)
+	defer log.SetLevel(log.InfoLevel)
+
+	req := httptest.NewRequest("GET", "/records", nil)
+	w := httptest.NewRecorder()
+	webhook.recordsHandler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Status code = %v, want %v (cached serve)", w.Code, http.StatusOK)
+	}
+	var got []*endpoint.Endpoint
+	if err := json.NewDecoder(w.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got) != 1 || got[0].DNSName != "a.example.com" {
+		t.Errorf("served endpoints = %v, want the cached set", got)
+	}
+}
+
+// A domain never fetched successfully has no cache, so the throttle must fall
+// through to 500 rather than serving a synthetic empty 200 -- an empty set
+// under --policy=sync would delete every record in the zone.
+func TestRecordsHandler_NoSyntheticEmptyWhenCacheMissing(t *testing.T) {
+	webhook := throttledWebhook(600 * time.Second) // hasCache defaults to false
+
+	log.SetLevel(log.ErrorLevel)
+	defer log.SetLevel(log.InfoLevel)
+
+	req := httptest.NewRequest("GET", "/records", nil)
+	w := httptest.NewRecorder()
+	webhook.recordsHandler(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("Status code = %v, want %v (no cache -> 500, not empty 200)", w.Code, http.StatusInternalServerError)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/michelangelomo/external-dns-desec-provider/internal/config"
@@ -21,10 +22,24 @@ type DesecClient struct {
 	defaultTTL    int
 	domainFilters []string
 	rateLimit     *rateLimitTracker
+
+	cacheMu sync.Mutex
+	cache   map[string]cachedEndpoints
+}
+
+type cachedEndpoints struct {
+	endpoints []*endpoint.Endpoint
+	fetchedAt time.Time
 }
 
 const (
 	minimumTTL = 3600 // Minimum TTL for desec is 3600 seconds
+
+	// maxCacheStaleness caps how old a last-known-good record set may be before
+	// it is no longer served during a throttle window. Past it we prefer a 500
+	// (retried next interval) over feeding external-dns a stale zone under
+	// --policy=sync, which could delete records that in fact still exist.
+	maxCacheStaleness = 24 * time.Hour
 )
 
 // retryableLogger adapts logrus to retryablehttp.LeveledLogger so the retry
@@ -75,6 +90,7 @@ func CreateDesecClient(config config.Config) (*DesecClient, error) {
 		defaultTTL:    config.DefaultTTL,
 		domainFilters: config.DomainFilters,
 		rateLimit:     tracker,
+		cache:         make(map[string]cachedEndpoints),
 	}
 	return client, nil
 }
@@ -118,7 +134,46 @@ func (d *DesecClient) GetEndpoints(ctx context.Context, domain string) ([]*endpo
 			rrset.SubName, rrset.Type, ep.DNSName, ep.RecordType, ep.Targets, ep.RecordTTL)
 		endpoints = append(endpoints, ep)
 	}
+
+	// Remember this successful fetch as last-known-good so a later throttle
+	// window can be answered from cache instead of a 500.
+	d.cacheMu.Lock()
+	d.cache[domain] = cachedEndpoints{endpoints: endpoints, fetchedAt: d.rateLimit.now()}
+	d.cacheMu.Unlock()
+
 	return endpoints, nil
+}
+
+// Throttled reports whether a deSEC throttle window observed from a prior 429 is
+// still open. Handlers consult it to decide whether serving stale cached records
+// is warranted.
+func (d *DesecClient) Throttled() bool {
+	return d.rateLimit.wait() > 0
+}
+
+// CachedEndpoints returns last-known-good endpoints for every requested domain,
+// but only all-or-nothing: if any domain has never been fetched successfully or
+// its cache is older than maxCacheStaleness, it returns ok=false. Serving a
+// partial set under --policy=sync would make external-dns recreate the missing
+// domain's records, so a gap must fall through to a 500 instead.
+func (d *DesecClient) CachedEndpoints(domains []string) ([]*endpoint.Endpoint, bool) {
+	d.cacheMu.Lock()
+	defer d.cacheMu.Unlock()
+
+	now := d.rateLimit.now()
+	endpoints := []*endpoint.Endpoint{}
+	for _, domain := range domains {
+		entry, ok := d.cache[domain]
+		if !ok {
+			return nil, false
+		}
+		if now.Sub(entry.fetchedAt) > maxCacheStaleness {
+			log.Warnf("cached records for %s are older than %s; not serving stale zone", domain, maxCacheStaleness)
+			return nil, false
+		}
+		endpoints = append(endpoints, entry.endpoints...)
+	}
+	return endpoints, true
 }
 
 func (d *DesecClient) ApplyChanges(ctx context.Context, changes plan.Changes) error {

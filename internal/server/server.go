@@ -29,6 +29,8 @@ type desecProvider interface {
 	GetEndpoints(ctx context.Context, domain string) ([]*endpoint.Endpoint, error)
 	ApplyChanges(ctx context.Context, changes plan.Changes) error
 	AdjustEndpoints(endpoints []*endpoint.Endpoint) ([]*endpoint.Endpoint, error)
+	Throttled() bool
+	CachedEndpoints(domains []string) ([]*endpoint.Endpoint, bool)
 }
 
 type webhook struct {
@@ -99,14 +101,23 @@ func (webhook webhook) recordsHandler(w http.ResponseWriter, r *http.Request) {
 	for _, domain := range webhook.config.DomainFilters {
 		domainEndpoints, err := webhook.desecClient.GetEndpoints(r.Context(), domain)
 		if err != nil {
-			// external-dns's webhook client treats 429 as a HARD fatal error and
-			// only 500..510 as a retryable SoftError, so a throttle must surface
-			// as 500 (logged + retried next interval, no crash) -- never 429. The
-			// real Retry-After is still exposed for operators even though
-			// external-dns ignores it.
 			var rle *provider.RateLimitError
 			if errors.As(err, &rle) {
-				log.Warnf("rate limited fetching records for domain %s: %v", domain, rle)
+				// While throttled, prefer last-known-good records over failing:
+				// serve them as 200 only when EVERY domain has a usable cache
+				// entry (all-or-nothing). A partial set under --policy=sync would
+				// make external-dns recreate the missing domain's records.
+				if cached, ok := webhook.desecClient.CachedEndpoints(webhook.config.DomainFilters); ok {
+					log.Warnf("deSEC throttled; serving %d cached records (retry after %s)", len(cached), rle.RetryAfter)
+					writeEndpoints(w, cached)
+					return
+				}
+				// No usable cache: external-dns treats 429 as a HARD fatal error
+				// and only 500..510 as a retryable SoftError, so surface 500
+				// (logged + retried next interval, no crash) -- never 429. The
+				// real Retry-After is exposed for operators even though
+				// external-dns ignores it.
+				log.Warnf("rate limited fetching records for domain %s, no usable cache: %v", domain, rle)
 				w.Header().Set("Retry-After", strconv.Itoa(int(rle.RetryAfter.Seconds())))
 				w.WriteHeader(http.StatusInternalServerError)
 				_, _ = fmt.Fprintf(w, "deSEC rate limit active, retry after %s", rle.RetryAfter)
@@ -121,6 +132,11 @@ func (webhook webhook) recordsHandler(w http.ResponseWriter, r *http.Request) {
 		endpoints = append(endpoints, domainEndpoints...)
 	}
 
+	writeEndpoints(w, endpoints)
+}
+
+// writeEndpoints encodes an endpoint slice as the webhook /records 200 body.
+func writeEndpoints(w http.ResponseWriter, endpoints []*endpoint.Endpoint) {
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(endpoints); err != nil {
 		log.Errorf("failed to encode endpoints: %v", err)
